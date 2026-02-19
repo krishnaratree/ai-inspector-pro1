@@ -1,0 +1,7 @@
+{
+  "name": "Ai inspector pro",
+  "description": "Professional AI-powered tool for detecting car damage with 20-photo batch processing and agentic finger-point focus.",
+  "requestFramePermissions": [
+    "camera"
+  ]
+}
