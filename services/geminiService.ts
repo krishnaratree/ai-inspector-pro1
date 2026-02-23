@@ -1,155 +1,138 @@
-import { GoogleGenAI, Type } from "@google/genai";
-import { DamageDetection } from "../types";
+// services/geminiService.ts
+import { GoogleGenerativeAI, type GenerativeModel } from "@google/generative-ai";
+import { ThrottleQueue, withRetry } from "./rateLimit";
+import type { DamageDetection } from "../types";
 
-// แนะนำ: ถ้า model นี้ยัง error ให้ลองเปลี่ยนเป็น "gemini-2.0-flash" ชั่วคราวเพื่อเทสให้ผ่านก่อน
+// ✅ ปรับเลขตามที่คุณต้องการ
+// - minTimeMs: เว้นระยะขั้นต่ำระหว่าง request
+// - concurrency: 1 = ยิงทีละ 1 เพื่อไม่ชน rate limit ง่าย
+const limiter = new ThrottleQueue(1, 1400);
+
+// --- your existing config ---
 const MODEL_NAME = "gemini-3-flash-preview";
 
-/**
- * Get Gemini API key from Vite env.
- * NOTE: This exposes the key to the browser bundle.
- * For production, move this call to a backend / serverless function.
- */
 function getApiKey(): string {
   const key = (import.meta.env.VITE_GEMINI_API_KEY as string) || "";
   if (!key) {
-    // ทำให้ error ชัดเจนว่าปัญหาเป็นเรื่อง env
     throw new Error(
-      "Missing VITE_GEMINI_API_KEY. Please set it in .env.local and restart `npm run dev`."
+      "Missing VITE_GEMINI_API_KEY. Please set it in .env.local (local) and Vercel Environment Variables (prod)."
     );
   }
   return key;
 }
 
-function getClient(): GoogleGenAI {
+function getModel(): GenerativeModel {
   const apiKey = getApiKey();
-  return new GoogleGenAI({ apiKey });
+  const ai = new GoogleGenerativeAI(apiKey);
+  return ai.getGenerativeModel({ model: MODEL_NAME });
 }
 
+/**
+ * helper: run a Gemini call via throttle + retry
+ */
+async function runGemini<T>(call: () => Promise<T>): Promise<T> {
+  return limiter.schedule(() =>
+    withRetry(call, {
+      maxRetries: 5,
+      baseDelayMs: 1200,
+      maxDelayMs: 20000,
+      jitterRatio: 0.25,
+      onRetry: ({ attempt, delayMs, err }) => {
+        console.warn(
+          `[Gemini retry] attempt=${attempt} delayMs=${delayMs} err=`,
+          err
+        );
+      },
+    })
+  );
+}
+
+// ----------------------------
+// Example: analyzeImage
+// ----------------------------
 export async function analyzeImage(base64Image: string): Promise<DamageDetection[]> {
-  const ai = getClient();
+  const model = getModel();
 
   const prompt = `
 Analyze this car image for scratches, dents, or paint damage.
-AGENTIC FINGER FOCUS: Look specifically for fingers or hands pointing at parts of the car.
-If a finger is pointing at a surface, treat the area near the fingertip as a high-priority inspection zone.
-
-Identify all suspicious areas. For each area, provide normalized coordinates [ymin, xmin, ymax, xmax] (0-1000 scale).
-If an area is near a pointing finger, categorize it with high confidence if damage is visible.
-If you find a spot that might be a reflection but it's not 100% clear, mark it for further zoom analysis by setting 'isConfirmedDamage' to false.
-
-Return the result strictly as a JSON array of objects.
+Return JSON array with:
+[
+  {
+    "id": "unique",
+    "type": "Scratch|Dent|Crack|PaintDamage|Other",
+    "description": "...",
+    "confidence": 0-1,
+    "isConfirmedDamage": true|false,
+    "boundingBox": [ymin, xmin, ymax, xmax] // 0..1000
+  }
+]
+No markdown. JSON only.
 `.trim();
 
-  // ป้องกันเคสส่ง data URL ทั้งเส้น
-  const imageData = base64Image.includes(",") ? base64Image.split(",")[1] : base64Image;
-
-  try {
-    const response = await ai.models.generateContent({
-      model: MODEL_NAME,
-      contents: [
-        {
-          parts: [
-            { text: prompt },
-            {
-              inlineData: {
-                mimeType: "image/jpeg",
-                data: imageData,
-              },
-            },
-          ],
-        },
-      ],
-      config: {
-        responseMimeType: "application/json",
-        responseSchema: {
-          type: Type.ARRAY,
-          items: {
-            type: Type.OBJECT,
-            properties: {
-              type: {
-                type: Type.STRING,
-                description: "Type of anomaly detected: 'scratch', 'dent', 'reflection', or 'other'",
-              },
-              confidence: { type: Type.NUMBER },
-              boundingBox: {
-                type: Type.ARRAY,
-                items: { type: Type.NUMBER },
-                description: "[ymin, xmin, ymax, xmax] coordinates (0-1000 scale)",
-              },
-              description: { type: Type.STRING },
-              isConfirmedDamage: {
-                type: Type.BOOLEAN,
-                description: "True if definitively damage, False if it needs a high-detail zoom check",
-              },
-            },
-            required: ["type", "confidence", "boundingBox", "description", "isConfirmedDamage"],
-          },
+  // ✅ ครอบ generateContent ด้วย runGemini
+  const result = await runGemini(async () => {
+    return model.generateContent([
+      { text: prompt },
+      {
+        inlineData: {
+          data: base64Image.replace(/^data:image\/\w+;base64,/, ""),
+          mimeType: "image/jpeg",
         },
       },
-    });
+    ]);
+  });
 
-    const text = response.text || "[]";
+  const text = result.response.text();
 
-    let results: any[] = [];
-    try {
-      results = JSON.parse(text);
-      if (!Array.isArray(results)) results = [];
-    } catch (e) {
-      console.error("Failed to parse JSON from model:", text);
-      results = [];
-    }
-
-    return results.map((r: any, index: number) => ({
-      ...r,
-      id: `det-${index}-${Date.now()}`,
-    }));
-  } catch (error) {
-    console.error("Gemini Detection Error:", error);
-    throw error;
-  }
+  // parse JSON ตามของเดิมคุณ
+  const detections = safeParseJsonArray<DamageDetection>(text);
+  return detections;
 }
 
+// ----------------------------
+// Example: zoomAnalysis
+// ----------------------------
 export async function zoomAnalysis(
   originalBase64: string,
   zoomedBase64: string,
-  initialDescription: string
+  hint: string
 ): Promise<string> {
-  const ai = getClient();
+  const model = getModel();
 
   const prompt = `
-This is a high-resolution zoomed-in view of a suspicious area on a car.
-Often, a finger is pointing to this specific area in the original context.
-
-Examine the surface texture, edges, and light refraction carefully.
-Identify if this is a physical scratch (depth/irregular edges), a dent, or just a reflection of the surroundings.
-
-Provide a professional, concise technical conclusion (2-3 sentences).
+You are verifying whether the highlighted area is real damage.
+Hint: ${hint}
+Return a short sentence report (no JSON).
 `.trim();
 
-  const zoomedData = zoomedBase64.includes(",") ? zoomedBase64.split(",")[1] : zoomedBase64;
-
-  try {
-    const response = await ai.models.generateContent({
-      model: MODEL_NAME,
-      contents: [
-        {
-          parts: [
-            { text: prompt },
-            {
-              inlineData: {
-                mimeType: "image/jpeg",
-                data: zoomedData,
-              },
-            },
-          ],
+  const result = await runGemini(async () => {
+    return model.generateContent([
+      { text: prompt },
+      {
+        inlineData: {
+          data: zoomedBase64.replace(/^data:image\/\w+;base64,/, ""),
+          mimeType: "image/jpeg",
         },
-      ],
-    });
+      },
+    ]);
+  });
 
-    return response.text || "Detailed analysis inconclusive.";
-  } catch (error) {
-    console.error("Gemini Zoom Error:", error);
-    return "Failed to complete detailed zoom analysis.";
-  }
+  return result.response.text().trim();
 }
 
+// ----------------------------
+// Utilities
+// ----------------------------
+function safeParseJsonArray<T>(raw: string): T[] {
+  // ดึง JSON ก้อนแรกที่เป็น array ออกมา เผื่อโมเดลพ่นข้อความอื่น
+  const match = raw.match(/\[[\s\S]*\]/);
+  const jsonText = match ? match[0] : raw;
+
+  try {
+    const parsed = JSON.parse(jsonText);
+    return Array.isArray(parsed) ? (parsed as T[]) : [];
+  } catch (e) {
+    console.error("JSON parse failed:", e, { raw });
+    return [];
+  }
+}
