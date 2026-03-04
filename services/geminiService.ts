@@ -3,12 +3,10 @@ import { GoogleGenerativeAI, type GenerativeModel } from "@google/generative-ai"
 import { ThrottleQueue, withRetry } from "./rateLimit";
 import type { DamageDetection } from "../types";
 
-// ✅ ปรับเลขตามที่คุณต้องการ
-// - minTimeMs: เว้นระยะขั้นต่ำระหว่าง request
-// - concurrency: 1 = ยิงทีละ 1 เพื่อไม่ชน rate limit ง่าย
-const limiter = new ThrottleQueue(1, 1400);
+// ✅ Free tier RPM=5 → เว้นอย่างน้อย ~12s ต่อ 1 request (กัน 429)
+const limiter = new ThrottleQueue(1, 13000);
 
-// --- your existing config ---
+// --- config ---
 const MODEL_NAME = "gemini-3-flash-preview";
 
 function getApiKey(): string {
@@ -21,10 +19,25 @@ function getApiKey(): string {
   return key;
 }
 
+// ✅ cache model (ไม่สร้าง client/model ใหม่ทุกครั้ง)
+let cachedModel: GenerativeModel | null = null;
+
 function getModel(): GenerativeModel {
+  if (cachedModel) return cachedModel;
   const apiKey = getApiKey();
   const ai = new GoogleGenerativeAI(apiKey);
-  return ai.getGenerativeModel({ model: MODEL_NAME });
+  cachedModel = ai.getGenerativeModel({ model: MODEL_NAME });
+  return cachedModel;
+}
+
+function isDailyQuotaExceeded(err: unknown): boolean {
+  const msg = String((err as any)?.message ?? "");
+  // เจอคำพวกนี้ใน error 429 แบบ "quota per day" → retry ก็ไม่ช่วย
+  return (
+    msg.includes("GenerateRequestsPerDay") ||
+    msg.includes("quota") ||
+    msg.includes("Quota exceeded")
+  );
 }
 
 /**
@@ -33,11 +46,16 @@ function getModel(): GenerativeModel {
 async function runGemini<T>(call: () => Promise<T>): Promise<T> {
   return limiter.schedule(() =>
     withRetry(call, {
-      maxRetries: 5,
-      baseDelayMs: 1200,
-      maxDelayMs: 20000,
+      // ✅ ลด retry เพราะ retry ทำให้กิน RPD/RPM ไว
+      maxRetries: 2,
+      baseDelayMs: 1500,
+      maxDelayMs: 15000,
       jitterRatio: 0.25,
       onRetry: ({ attempt, delayMs, err }) => {
+        // ✅ ถ้าเป็นโควต้าต่อวันหมด ไม่ต้อง retry
+        if (isDailyQuotaExceeded(err)) {
+          throw err;
+        }
         console.warn(
           `[Gemini retry] attempt=${attempt} delayMs=${delayMs} err=`,
           err
@@ -48,9 +66,11 @@ async function runGemini<T>(call: () => Promise<T>): Promise<T> {
 }
 
 // ----------------------------
-// Example: analyzeImage
+// analyzeImage
 // ----------------------------
-export async function analyzeImage(base64Image: string): Promise<DamageDetection[]> {
+export async function analyzeImage(
+  base64Image: string
+): Promise<DamageDetection[]> {
   const model = getModel();
 
   const prompt = `
@@ -69,28 +89,26 @@ Return JSON array with:
 No markdown. JSON only.
 `.trim();
 
-  // ✅ ครอบ generateContent ด้วย runGemini
-  const result = await runGemini(async () => {
-    return model.generateContent([
+  const imageData = base64Image.replace(/^data:image\/\w+;base64,/, "");
+
+  const result = await runGemini(() =>
+    model.generateContent([
       { text: prompt },
       {
         inlineData: {
-          data: base64Image.replace(/^data:image\/\w+;base64,/, ""),
+          data: imageData,
           mimeType: "image/jpeg",
         },
       },
-    ]);
-  });
+    ])
+  );
 
   const text = result.response.text();
-
-  // parse JSON ตามของเดิมคุณ
-  const detections = safeParseJsonArray<DamageDetection>(text);
-  return detections;
+  return safeParseJsonArray<DamageDetection>(text);
 }
 
 // ----------------------------
-// Example: zoomAnalysis
+// zoomAnalysis
 // ----------------------------
 export async function zoomAnalysis(
   originalBase64: string,
@@ -105,17 +123,19 @@ Hint: ${hint}
 Return a short sentence report (no JSON).
 `.trim();
 
-  const result = await runGemini(async () => {
-    return model.generateContent([
+  const zoomed = zoomedBase64.replace(/^data:image\/\w+;base64,/, "");
+
+  const result = await runGemini(() =>
+    model.generateContent([
       { text: prompt },
       {
         inlineData: {
-          data: zoomedBase64.replace(/^data:image\/\w+;base64,/, ""),
+          data: zoomed,
           mimeType: "image/jpeg",
         },
       },
-    ]);
-  });
+    ])
+  );
 
   return result.response.text().trim();
 }
@@ -124,7 +144,6 @@ Return a short sentence report (no JSON).
 // Utilities
 // ----------------------------
 function safeParseJsonArray<T>(raw: string): T[] {
-  // ดึง JSON ก้อนแรกที่เป็น array ออกมา เผื่อโมเดลพ่นข้อความอื่น
   const match = raw.match(/\[[\s\S]*\]/);
   const jsonText = match ? match[0] : raw;
 
