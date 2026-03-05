@@ -1,9 +1,15 @@
 // services/geminiService.ts
 import { GoogleGenerativeAI, type GenerativeModel } from "@google/generative-ai";
-import { ThrottleQueue, withRetry } from "./rateLimit";
+import { ThrottleQueue } from "./rateLimit";
 import type { DamageDetection } from "../types";
 
-const limiter = new ThrottleQueue(1, 1400);
+/**
+ * กัน 429 (Free tier RPM~5) => 1 request ต่อ ~13 วินาที
+ * ถ้าคุณใช้โปรเจกต์ผูก Billing แล้ว ค่อยลดลงได้ (เช่น 2500-4000ms)
+ */
+const limiter = new ThrottleQueue(1, 13000);
+
+// ใช้ชื่อโมเดลที่คุณใช้อยู่จริงใน AI Studio (จากภาพคือ gemini-3-flash-preview)
 const MODEL_NAME = "gemini-3-flash-preview";
 
 function getApiKey(): string {
@@ -20,35 +26,24 @@ function getModel(): GenerativeModel {
   return cachedModel;
 }
 
+/**
+ * ✅ สำคัญ: ไม่ retry ที่ service (กันยิงซ้ำซ้อน)
+ * ให้ retry ไปคุมที่ App.tsx ที่เดียวพอ
+ */
 async function runGemini<T>(call: () => Promise<T>): Promise<T> {
-  return limiter.schedule(() =>
-    withRetry(call, {
-      maxRetries: 1,
-      baseDelayMs: 800,
-      maxDelayMs: 3000,
-      jitterRatio: 0.2,
-    })
-  );
+  return limiter.schedule(() => call());
 }
 
-function stripDataUrlPrefix(dataUrl: string): string {
-  return dataUrl.replace(/^data:image\/\w+;base64,/, "");
-}
-
-// ----------------------------
-// analyzeImage
-// ----------------------------
 export async function analyzeImage(base64Image: string): Promise<DamageDetection[]> {
   const model = getModel();
 
-  // สั้นสุด + บังคับ JSON array only
+  // ✅ prompt สั้นมาก ลด TEXT token
   const prompt =
-    'Detect car damages. Output ONLY a JSON array. ' +
-    'Schema: [{"id":"...","type":"Scratch|Dent|Crack|PaintDamage|Other","description":"...","confidence":0-1,' +
-    '"isConfirmedDamage":true|false,"boundingBox":[ymin,xmin,ymax,xmax]}]. ' +
-    "boundingBox is 0..1000. No markdown, no extra text.";
+    `Return ONLY JSON array of damages. ` +
+    `Item schema: {"id":"...","type":"Scratch|Dent|Crack|PaintDamage|Other","description":"...","confidence":0-1,"isConfirmedDamage":true|false,"boundingBox":[ymin,xmin,ymax,xmax]} ` +
+    `bbox range 0..1000. No markdown.`;
 
-  const imageData = stripDataUrlPrefix(base64Image);
+  const imageData = base64Image.replace(/^data:image\/\w+;base64,/, "");
 
   const result = await runGemini(() =>
     model.generateContent({
@@ -63,9 +58,9 @@ export async function analyzeImage(base64Image: string): Promise<DamageDetection
       ],
       generationConfig: {
         temperature: 0,
-        maxOutputTokens: 180, // ลด output เพิ่มเติม
+        maxOutputTokens: 200, // ✅ ตัด output ให้สั้นลงอีก
       },
-      // ❌ ห้ามส่ง thinkingConfig เพราะ backend ไม่รับ -> 400
+      // ❌ ห้ามส่ง thinkingConfig เพราะจาก error ของคุณ: Unknown name "thinkingConfig"
     })
   );
 
@@ -73,49 +68,23 @@ export async function analyzeImage(base64Image: string): Promise<DamageDetection
   return safeParseJsonArray<DamageDetection>(text);
 }
 
-// ----------------------------
-// zoomAnalysis (ถ้าคุณยังใช้ใน App.tsx)
-// ----------------------------
+/**
+ * ✅ ปิดไว้ก่อนเพื่อ “ลด request + token หนัก ๆ”
+ * ถ้าจะกลับมาเปิด ค่อยใช้ทีหลัง (ใน App.tsx มี flag)
+ */
 export async function zoomAnalysis(
   _originalBase64: string,
-  zoomedBase64: string,
-  hint: string
+  _zoomedBase64: string,
+  _hint: string
 ): Promise<string> {
-  const model = getModel();
-
-  const prompt =
-    `Verify if the highlighted area is real damage. Hint: ${hint}\n` +
-    "Reply with ONE short sentence only.";
-
-  const zoomData = stripDataUrlPrefix(zoomedBase64);
-
-  const result = await runGemini(() =>
-    model.generateContent({
-      contents: [
-        {
-          role: "user",
-          parts: [
-            { text: prompt },
-            { inlineData: { data: zoomData, mimeType: "image/jpeg" } },
-          ],
-        },
-      ],
-      generationConfig: {
-        temperature: 0,
-        maxOutputTokens: 60,
-      },
-    })
-  );
-
-  return result.response.text().trim();
+  // return สั้น ๆ เพื่อไม่ทำอะไรตอนนี้
+  return "";
 }
 
-// ----------------------------
-// Utilities
-// ----------------------------
 function safeParseJsonArray<T>(raw: string): T[] {
   const match = raw.match(/\[[\s\S]*\]/);
   const jsonText = match ? match[0] : raw;
+
   try {
     const parsed = JSON.parse(jsonText);
     return Array.isArray(parsed) ? (parsed as T[]) : [];
