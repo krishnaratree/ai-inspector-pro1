@@ -1,42 +1,23 @@
-export type DamageDetection = {
+
+export interface DamageDetection {
   id: string;
-
-  type:
-    | "Scratch"
-    | "Dent"
-    | "Crack"
-    | "PaintDamage"
-    | "Other";
-
-  description: string;
-
-  // 0..1 confidence
+  type: 'scratch' | 'dent' | 'reflection' | 'other';
   confidence: number;
-
-  isConfirmedDamage: boolean;
-
-  // [ymin, xmin, ymax, xmax] range 0..1000
-  boundingBox: [number, number, number, number];
-
-  // Optional analysis from zoom / finger focus
+  boundingBox: [number, number, number, number]; // [ymin, xmin, ymax, xmax] in normalized 0-1000
+  description: string;
   zoomAnalysis?: string;
-};
+  isConfirmedDamage: boolean;
+}
 
-export type InspectionImage = {
+export interface AnalysisState {
+  isAnalyzing: boolean;
+  detections: DamageDetection[];
+  error?: string;
+}
+
+export interface InspectionImage {
   id: string;
-
   url: string;
-
+  analysis: AnalysisState;
   name: string;
-
-  analysis: {
-    isAnalyzing: boolean;
-
-    detections: DamageDetection[];
-
-    // ใช้คุม queue และ UI state
-    hasAnalyzed: boolean;
-
-    error?: string;
-  };
-};
+}
