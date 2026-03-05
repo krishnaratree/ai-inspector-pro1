@@ -1,23 +1,28 @@
-
-export interface DamageDetection {
+// types.ts
+export type DamageDetection = {
   id: string;
-  type: 'scratch' | 'dent' | 'reflection' | 'other';
-  confidence: number;
-  boundingBox: [number, number, number, number]; // [ymin, xmin, ymax, xmax] in normalized 0-1000
+  type: "Scratch" | "Dent" | "Crack" | "PaintDamage" | "Other";
   description: string;
-  zoomAnalysis?: string;
+  confidence: number; // 0..1
   isConfirmedDamage: boolean;
-}
+  boundingBox: [number, number, number, number]; // [ymin,xmin,ymax,xmax] 0..1000
+  zoomAnalysis?: string;
+};
 
-export interface AnalysisState {
-  isAnalyzing: boolean;
-  detections: DamageDetection[];
-  error?: string;
-}
-
-export interface InspectionImage {
+export type InspectionImage = {
   id: string;
   url: string;
-  analysis: AnalysisState;
   name: string;
-}
+  analysis: {
+    isAnalyzing: boolean;
+    detections: DamageDetection[];
+    error?: string;
+
+    /**
+     * ✅ สำคัญ: กันคิวหยิบภาพเดิมซ้ำ แม้ detections = []
+     * - false = ยังไม่เคยลองวิเคราะห์
+     * - true  = เคยวิเคราะห์แล้ว (สำเร็จหรือ error)
+     */
+    hasAnalyzed?: boolean;
+  };
+};
