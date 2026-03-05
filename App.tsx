@@ -7,7 +7,6 @@ import {
   Car,
   RotateCcw,
   ZoomIn,
-  Info,
   Plus,
   X,
   Image as ImageIcon,
@@ -19,9 +18,35 @@ import { DamageDetection, InspectionImage } from './types';
 
 const MAX_IMAGES = 20;
 
-// ✅ Retry settings
-const MAX_RETRIES = 3;
-const RETRY_BASE_DELAY_MS = 1200;
+// ✅ ปิด retry ใน App (ให้ service เป็นคนคุม retry/throttle แทน)
+const MAX_RETRIES = 0;
+const RETRY_BASE_DELAY_MS = 1200; // (ไม่ถูกใช้แล้ว แต่คงไว้ไม่กระทบ)
+
+async function downscaleDataUrl(dataUrl: string, maxSize = 1280, quality = 0.78): Promise<string> {
+  const img = new Image();
+  img.src = dataUrl;
+
+  await new Promise<void>((resolve) => {
+    img.onload = () => resolve();
+    img.onerror = () => resolve();
+  });
+
+  const w = img.naturalWidth || 1;
+  const h = img.naturalHeight || 1;
+  const scale = Math.min(1, maxSize / Math.max(w, h));
+  const nw = Math.max(1, Math.round(w * scale));
+  const nh = Math.max(1, Math.round(h * scale));
+
+  const canvas = document.createElement('canvas');
+  canvas.width = nw;
+  canvas.height = nh;
+
+  const ctx = canvas.getContext('2d');
+  if (!ctx) return dataUrl;
+
+  ctx.drawImage(img, 0, 0, nw, nh);
+  return canvas.toDataURL('image/jpeg', quality);
+}
 
 export default function App() {
   const [images, setImages] = useState<InspectionImage[]>([]);
@@ -30,8 +55,11 @@ export default function App() {
 
   const imageRef = useRef<HTMLImageElement>(null);
 
-  // ✅ Track retries per image (ไม่กระทบ type)
+  // ✅ Track retries per image (คงไว้ไม่กระทบ type)
   const retryRef = useRef<Record<string, number>>({});
+
+  // ✅ cache รูปสำหรับ zoom (กันโหลดซ้ำหลาย detection)
+  const imgCacheRef = useRef<Record<string, HTMLImageElement>>({});
 
   const currentImage = images[activeIndex] || null;
 
@@ -53,7 +81,6 @@ export default function App() {
   // --- Queue Processing Logic ---
   useEffect(() => {
     const processNextInQueue = async () => {
-      // หาภาพที่ยังไม่ถูกวิเคราะห์ + ไม่กำลังวิ่ง + ไม่มี error ค้าง
       const nextToProcessIndex = images.findIndex(
         img =>
           img.analysis.detections.length === 0 &&
@@ -81,15 +108,18 @@ export default function App() {
 
     filesToProcess.forEach(file => {
       const reader = new FileReader();
-      reader.onload = event => {
+      reader.onload = async event => {
+        const rawUrl = event.target?.result as string;
+        // ✅ ย่อรูปก่อนเก็บลง state (ลด IMAGE tokens มากที่สุด)
+        const optimizedUrl = await downscaleDataUrl(rawUrl, 1280, 0.78);
+
         const newImg: InspectionImage = {
           id: `img-${Date.now()}-${Math.random().toString(36).substr(2, 9)}`,
-          url: event.target?.result as string,
+          url: optimizedUrl,
           name: file.name,
           analysis: { isAnalyzing: false, detections: [] }
         };
 
-        // ✅ init retry counter
         retryRef.current[newImg.id] = 0;
 
         setImages(prev => {
@@ -100,7 +130,6 @@ export default function App() {
       reader.readAsDataURL(file);
     });
 
-    // reset input so selecting same file again triggers onChange
     e.target.value = '';
   };
 
@@ -109,8 +138,8 @@ export default function App() {
     const indexToRemove = images.findIndex(img => img.id === id);
     const newImages = images.filter(img => img.id !== id);
 
-    // ✅ cleanup retry counter
     delete retryRef.current[id];
+    delete imgCacheRef.current[id]; // ✅ cleanup cache ด้วย
 
     setImages(newImages);
 
@@ -149,24 +178,19 @@ export default function App() {
       const nextRetry = prevRetry + 1;
       retryRef.current[targetId] = nextRetry;
 
-      const msg =
-        err?.message ||
-        err?.toString?.() ||
-        'Unknown error';
-
+      const msg = err?.message || err?.toString?.() || 'Unknown error';
       console.error('analyzeImage failed:', err);
 
-      if (nextRetry <= MAX_RETRIES) {
+      // ✅ ปิด retry ใน App: แสดง error ครั้งเดียว (กันยิงซ้ำซ้อนกับ service)
+      if (MAX_RETRIES > 0 && nextRetry <= MAX_RETRIES) {
         updateImageAnalysisById(targetId, {
           isAnalyzing: false,
           detections: [],
           error: `Analysis failed. Retrying... (${nextRetry}/${MAX_RETRIES})`
         });
 
-        // ✅ เคลียร์ error หลังดีเลย์ เพื่อให้ queue หยิบไปวิเคราะห์ใหม่ "จริง"
         const delay = RETRY_BASE_DELAY_MS * nextRetry;
         window.setTimeout(() => {
-          // ถ้าภาพถูกลบไปแล้ว จะไม่ทำอะไร
           if (!(targetId in retryRef.current)) return;
           updateImageAnalysisById(targetId, { error: undefined });
         }, delay);
@@ -174,7 +198,7 @@ export default function App() {
         updateImageAnalysisById(targetId, {
           isAnalyzing: false,
           detections: [],
-          error: `Analysis failed after ${MAX_RETRIES} retries: ${msg}`
+          error: `Analysis failed: ${msg}`
         });
       }
     }
@@ -186,13 +210,17 @@ export default function App() {
 
     setZoomingId(detection.id);
 
-    const img = new Image();
-    img.src = targetImage.url;
-
-    await new Promise<void>(resolve => {
-      img.onload = () => resolve();
-      img.onerror = () => resolve(); // กันค้าง
-    });
+    // ✅ ใช้ cache รูป ป้องกันโหลดซ้ำ
+    let img = imgCacheRef.current[imgId];
+    if (!img) {
+      img = new Image();
+      img.src = targetImage.url;
+      await new Promise<void>(resolve => {
+        img.onload = () => resolve();
+        img.onerror = () => resolve();
+      });
+      imgCacheRef.current[imgId] = img;
+    }
 
     const tempCanvas = document.createElement('canvas');
     const ctx = tempCanvas.getContext('2d');
@@ -203,25 +231,27 @@ export default function App() {
 
     const [ymin, xmin, ymax, xmax] = detection.boundingBox;
 
-    const sx = (xmin / 1000) * img.naturalWidth;
-    const sy = (ymin / 1000) * img.naturalHeight;
-    const sw = ((xmax - xmin) / 1000) * img.naturalWidth;
-    const sh = ((ymax - ymin) / 1000) * img.naturalHeight;
+    const sx = (xmin / 1000) * (img.naturalWidth || 1);
+    const sy = (ymin / 1000) * (img.naturalHeight || 1);
+    const sw = ((xmax - xmin) / 1000) * (img.naturalWidth || 1);
+    const sh = ((ymax - ymin) / 1000) * (img.naturalHeight || 1);
 
     const padding = Math.min(sw, sh) * 0.7;
     const finalSx = Math.max(0, sx - padding);
     const finalSy = Math.max(0, sy - padding);
-    const finalSw = Math.min(img.naturalWidth - finalSx, sw + padding * 2);
-    const finalSh = Math.min(img.naturalHeight - finalSy, sh + padding * 2);
+    const finalSw = Math.min((img.naturalWidth || 1) - finalSx, sw + padding * 2);
+    const finalSh = Math.min((img.naturalHeight || 1) - finalSy, sh + padding * 2);
 
     tempCanvas.width = 512;
     tempCanvas.height = 512;
     ctx.drawImage(img, finalSx, finalSy, finalSw, finalSh, 0, 0, 512, 512);
 
-    const zoomedDataUrl = tempCanvas.toDataURL('image/jpeg');
+    // ✅ ลดคุณภาพ zoomed image เพื่อลด IMAGE tokens เพิ่มอีก
+    const zoomedDataUrl = tempCanvas.toDataURL('image/jpeg', 0.78);
 
     try {
-      const report = await zoomAnalysis(targetImage.url, zoomedDataUrl, detection.description);
+      // ✅ สำคัญ: อย่าส่ง original image เข้า zoomAnalysis (เผา token ซ้ำ)
+      const report = await zoomAnalysis('', zoomedDataUrl, detection.description);
 
       setImages(prev =>
         prev.map(imgItem => {
@@ -248,7 +278,8 @@ export default function App() {
     setImages([]);
     setActiveIndex(0);
     setZoomingId(null);
-    retryRef.current = {}; // ✅ reset retry counters
+    retryRef.current = {};
+    imgCacheRef.current = {}; // ✅ reset cache
   };
 
   const isAnyProcessing = images.some(img => img.analysis.isAnalyzing);
