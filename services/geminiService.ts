@@ -1,143 +1,157 @@
-import { GoogleGenerativeAI } from "@google/generative-ai";
-import { ThrottleQueue } from "./rateLimit";
+// services/geminiService.ts
+import { GoogleGenerativeAI, type GenerativeModel } from "@google/generative-ai";
+import { ThrottleQueue, withRetry } from "./rateLimit";
 import type { DamageDetection } from "../types";
 
-const MODEL = "gemini-3-flash-preview";
-
-// 1 req / 13s ตามเดิม (คุณปรับได้)
+// ✅ Free tier RPM=5 → เว้นอย่างน้อย ~12s ต่อ 1 request (กัน 429)
 const limiter = new ThrottleQueue(1, 13000);
 
-// ✅ กันยิงซ้ำ: in-flight dedupe + cache
-const inFlight = new Map<string, Promise<DamageDetection[]>>();
-const cache = new Map<string, { at: number; data: DamageDetection[] }>();
-const CACHE_TTL_MS = 60_000; // 60s
+// --- config ---
+const MODEL_NAME = "gemini-3-flash-preview";
 
-let modelSingleton: ReturnType<GoogleGenerativeAI["getGenerativeModel"]> | null = null;
-
-function getModel() {
-  if (modelSingleton) return modelSingleton;
-
-  const apiKey = import.meta.env.VITE_GEMINI_API_KEY;
-  if (!apiKey) throw new Error("Missing GEMINI API KEY");
-
-  const genAI = new GoogleGenerativeAI(apiKey);
-  modelSingleton = genAI.getGenerativeModel({ model: MODEL });
-  return modelSingleton;
-}
-
-// ✅ key จากรูป (เบา + เร็ว): ใช้ส่วนหัว/ท้าย + length กันชนกัน
-function makeImageKey(base64Image: string) {
-  const s = base64Image;
-  const head = s.slice(0, 120);
-  const tail = s.slice(-120);
-  return `${s.length}:${head}:${tail}`;
-}
-
-function stripDataUrl(base64Image: string) {
-  return base64Image.replace(/^data:image\/\w+;base64,/, "");
-}
-
-// ✅ retry เฉพาะ 429 + backoff
-async function withRetry429<T>(fn: () => Promise<T>, maxRetry = 3): Promise<T> {
-  let attempt = 0;
-  while (true) {
-    try {
-      return await fn();
-    } catch (e: any) {
-      const msg = String(e?.message ?? "");
-      const is429 =
-        e?.status === 429 ||
-        msg.includes("429") ||
-        msg.toLowerCase().includes("too many requests") ||
-        msg.toLowerCase().includes("rate limit");
-
-      if (!is429 || attempt >= maxRetry) throw e;
-
-      // exponential backoff + jitter (คุมไม่ให้ยิงถี่)
-      const base = 1500 * Math.pow(2, attempt);
-      const jitter = Math.floor(Math.random() * 400);
-      const waitMs = Math.min(15000, base + jitter);
-
-      await new Promise((r) => setTimeout(r, waitMs));
-      attempt++;
-    }
-  }
-}
-
-export async function analyzeImage(base64Image: string): Promise<DamageDetection[]> {
-  const key = makeImageKey(base64Image);
-
-  // ✅ cache hit
-  const cached = cache.get(key);
-  if (cached && Date.now() - cached.at < CACHE_TTL_MS) {
-    return cached.data;
-  }
-
-  // ✅ in-flight dedupe
-  const existing = inFlight.get(key);
-  if (existing) return existing;
-
-  const p = (async () => {
-    const model = getModel();
-
-    // ✅ prompt สั้นลง เพื่อลด token
-    const prompt =
-      'Return ONLY a JSON array. No markdown, no extra text.\n' +
-      'Each item schema:\n' +
-      '{"id":"string","type":"Scratch|Dent|Crack|PaintDamage|Other","description":"string","confidence":0-1,"isConfirmedDamage":true|false,"boundingBox":[ymin,xmin,ymax,xmax]}\n' +
-      "Rules:\n" +
-      "- boundingBox values are integers 0..1000\n" +
-      "- If no damage, return []\n" +
-      "- Max 20 items\n";
-
-    const imageData = stripDataUrl(base64Image);
-
-    const result = await limiter.schedule(() =>
-      withRetry429(() =>
-        model.generateContent({
-          contents: [
-            {
-              role: "user",
-              parts: [
-                { text: prompt },
-                {
-                  inlineData: {
-                    data: imageData,
-                    mimeType: "image/jpeg",
-                  },
-                },
-              ],
-            },
-          ],
-          generationConfig: {
-            temperature: 0,
-            maxOutputTokens: 160, // ✅ ลด token output
-            // ถ้า SDK/รุ่นรองรับ ให้เปิดใช้ จะช่วยคุมรูปแบบ output:
-            // responseMimeType: "application/json",
-          },
-        })
-      )
+function getApiKey(): string {
+  const key = (import.meta.env.VITE_GEMINI_API_KEY as string) || "";
+  if (!key) {
+    throw new Error(
+      "Missing VITE_GEMINI_API_KEY. Please set it in .env.local (local) and Vercel Environment Variables (prod)."
     );
+  }
+  return key;
+}
 
-    const text = result.response.text();
+// ✅ cache model (ไม่สร้าง client/model ใหม่ทุกครั้ง)
+let cachedModel: GenerativeModel | null = null;
 
-    let parsed: DamageDetection[] = [];
-    try {
-      const json = text.match(/\[[\s\S]*\]/)?.[0] ?? "[]";
-      parsed = JSON.parse(json);
-    } catch {
-      parsed = [];
-    }
+function getModel(): GenerativeModel {
+  if (cachedModel) return cachedModel;
+  const apiKey = getApiKey();
+  const ai = new GoogleGenerativeAI(apiKey);
+  cachedModel = ai.getGenerativeModel({ model: MODEL_NAME });
+  return cachedModel;
+}
 
-    cache.set(key, { at: Date.now(), data: parsed });
-    return parsed;
-  })();
+function isDailyQuotaExceeded(err: unknown): boolean {
+  const msg = String((err as any)?.message ?? "");
+  // เจอคำพวกนี้ใน error 429 แบบ "quota per day" → retry ก็ไม่ช่วย
+  return (
+    msg.includes("GenerateRequestsPerDay") ||
+    msg.includes("quota") ||
+    msg.includes("Quota exceeded")
+  );
+}
 
-  inFlight.set(key, p);
+/**
+ * helper: run a Gemini call via throttle + retry
+ */
+async function runGemini<T>(call: () => Promise<T>): Promise<T> {
+  return limiter.schedule(() =>
+    withRetry(call, {
+      // ✅ ลด retry เพราะ retry ทำให้กิน RPD/RPM ไว
+      maxRetries: 2,
+      baseDelayMs: 1500,
+      maxDelayMs: 15000,
+      jitterRatio: 0.25,
+      onRetry: ({ attempt, delayMs, err }) => {
+        // ✅ ถ้าเป็นโควต้าต่อวันหมด ไม่ต้อง retry
+        if (isDailyQuotaExceeded(err)) {
+          throw err;
+        }
+        console.warn(
+          `[Gemini retry] attempt=${attempt} delayMs=${delayMs} err=`,
+          err
+        );
+      },
+    })
+  );
+}
+
+// ----------------------------
+// analyzeImage
+// ----------------------------
+export async function analyzeImage(
+  base64Image: string
+): Promise<DamageDetection[]> {
+  const model = getModel();
+
+  const prompt = `
+Analyze this car image for scratches, dents, or paint damage.
+Return JSON array with:
+[
+  {
+    "id": "unique",
+    "type": "Scratch|Dent|Crack|PaintDamage|Other",
+    "description": "...",
+    "confidence": 0-1,
+    "isConfirmedDamage": true|false,
+    "boundingBox": [ymin, xmin, ymax, xmax] // 0..1000
+  }
+]
+No markdown. JSON only.
+`.trim();
+
+  const imageData = base64Image.replace(/^data:image\/\w+;base64,/, "");
+
+  const result = await runGemini(() =>
+    model.generateContent([
+      { text: prompt },
+      {
+        inlineData: {
+          data: imageData,
+          mimeType: "image/jpeg",
+        },
+      },
+    ])
+  );
+
+  const text = result.response.text();
+  return safeParseJsonArray<DamageDetection>(text);
+}
+
+// ----------------------------
+// zoomAnalysis
+// ----------------------------
+export async function zoomAnalysis(
+  originalBase64: string,
+  zoomedBase64: string,
+  hint: string
+): Promise<string> {
+  const model = getModel();
+
+  const prompt = `
+You are verifying whether the highlighted area is real damage.
+Hint: ${hint}
+Return a short sentence report (no JSON).
+`.trim();
+
+  const zoomed = zoomedBase64.replace(/^data:image\/\w+;base64,/, "");
+
+  const result = await runGemini(() =>
+    model.generateContent([
+      { text: prompt },
+      {
+        inlineData: {
+          data: zoomed,
+          mimeType: "image/jpeg",
+        },
+      },
+    ])
+  );
+
+  return result.response.text().trim();
+}
+
+// ----------------------------
+// Utilities
+// ----------------------------
+function safeParseJsonArray<T>(raw: string): T[] {
+  const match = raw.match(/\[[\s\S]*\]/);
+  const jsonText = match ? match[0] : raw;
 
   try {
-    return await p;
-  } finally {
-    inFlight.delete(key);
+    const parsed = JSON.parse(jsonText);
+    return Array.isArray(parsed) ? (parsed as T[]) : [];
+  } catch (e) {
+    console.error("JSON parse failed:", e, { raw });
+    return [];
   }
 }
