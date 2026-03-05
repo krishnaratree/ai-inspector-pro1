@@ -13,49 +13,50 @@ import {
   Loader2,
   Fingerprint,
 } from "lucide-react";
-import { analyzeImage, zoomAnalysis } from "./services/geminiService";
-import { DamageDetection, InspectionImage } from "./types";
+import { analyzeImage } from "./services/geminiService";
+import type { DamageDetection, InspectionImage } from "./types";
 
 const MAX_IMAGES = 20;
 
-// ✅ Retry settings
-const MAX_RETRIES = 3;
-const RETRY_BASE_DELAY_MS = 1200;
+// ✅ Retry settings (คุมที่ App.tsx ที่เดียว)
+const MAX_RETRIES = 2;
+const RETRY_BASE_DELAY_MS = 1500;
+
+// ✅ ปิด Zoom analysis เพื่อลด request/token หนัก ๆ
+const DO_ZOOM_ANALYSIS = false;
 
 /**
- * ✅ Compress image to reduce INPUT token:
- * - downscale to maxSide (default 1024)
- * - convert to JPEG (default quality 0.75)
+ * ✅ ลด token: บีบ/ย่อรูปก่อนส่งให้ Gemini
+ * - maxSide: 1024
+ * - quality: 0.75
  */
 async function compressImageToJpegDataUrl(
-  dataUrl: string,
+  inputDataUrl: string,
   maxSide = 1024,
   quality = 0.75
 ): Promise<string> {
   const img = new Image();
-  img.src = dataUrl;
+  img.src = inputDataUrl;
 
   await new Promise<void>((resolve) => {
     img.onload = () => resolve();
     img.onerror = () => resolve();
   });
 
-  const w = img.naturalWidth || 0;
-  const h = img.naturalHeight || 0;
-  if (!w || !h) return dataUrl;
+  const w = img.naturalWidth || 1;
+  const h = img.naturalHeight || 1;
 
   const scale = Math.min(1, maxSide / Math.max(w, h));
-  const nw = Math.max(1, Math.round(w * scale));
-  const nh = Math.max(1, Math.round(h * scale));
+  const tw = Math.max(1, Math.round(w * scale));
+  const th = Math.max(1, Math.round(h * scale));
 
   const canvas = document.createElement("canvas");
-  canvas.width = nw;
-  canvas.height = nh;
-
+  canvas.width = tw;
+  canvas.height = th;
   const ctx = canvas.getContext("2d");
-  if (!ctx) return dataUrl;
+  if (!ctx) return inputDataUrl;
 
-  ctx.drawImage(img, 0, 0, nw, nh);
+  ctx.drawImage(img, 0, 0, tw, th);
   return canvas.toDataURL("image/jpeg", quality);
 }
 
@@ -65,31 +66,20 @@ export default function App() {
   const [zoomingId, setZoomingId] = useState<string | null>(null);
 
   const imageRef = useRef<HTMLImageElement>(null);
-
-  // ✅ Track retries per image (ไม่กระทบ type)
   const retryRef = useRef<Record<string, number>>({});
 
   const currentImage = images[activeIndex] || null;
 
   // --- Helpers ---
-  const updateImageAnalysis = (
-    index: number,
-    updates: Partial<InspectionImage["analysis"]>
-  ) => {
-    setImages((prev) =>
-      prev.map((img, idx) =>
-        idx === index ? { ...img, analysis: { ...img.analysis, ...updates } } : img
-      )
-    );
-  };
-
   const updateImageAnalysisById = (
     id: string,
     updates: Partial<InspectionImage["analysis"]>
   ) => {
     setImages((prev) =>
       prev.map((img) =>
-        img.id === id ? { ...img, analysis: { ...img.analysis, ...updates } } : img
+        img.id === id
+          ? { ...img, analysis: { ...img.analysis, ...updates } }
+          : img
       )
     );
   };
@@ -97,17 +87,18 @@ export default function App() {
   // --- Queue Processing Logic ---
   useEffect(() => {
     const processNextInQueue = async () => {
-      // หาภาพที่ยังไม่ถูกวิเคราะห์ + ไม่กำลังวิ่ง + ไม่มี error ค้าง
+      const isAnythingAnalyzing = images.some((img) => img.analysis.isAnalyzing);
+      if (isAnythingAnalyzing) return;
+
+      // ✅ สำคัญ: ใช้ hasAnalyzed กันหยิบซ้ำ
       const nextToProcessIndex = images.findIndex(
         (img) =>
-          img.analysis.detections.length === 0 &&
+          !img.analysis.hasAnalyzed &&
           !img.analysis.isAnalyzing &&
           !img.analysis.error
       );
 
-      const isAnythingAnalyzing = images.some((img) => img.analysis.isAnalyzing);
-
-      if (nextToProcessIndex !== -1 && !isAnythingAnalyzing) {
+      if (nextToProcessIndex !== -1) {
         await runAnalysisForIndex(nextToProcessIndex);
       }
     };
@@ -125,37 +116,35 @@ export default function App() {
 
     filesToProcess.forEach((file) => {
       const reader = new FileReader();
-
-      // ✅ ทำให้ onload เป็น async แล้ว compress ก่อน setImages
       reader.onload = async (event) => {
-        const rawUrl = event.target?.result as string;
-        if (!rawUrl) return;
+        const rawUrl = (event.target?.result as string) || "";
 
-        // ✅ ลด token หนักๆ ที่รูป (แนะนำ 1024/0.75)
+        // ✅ ลด token หนัก ๆ ที่รูป
         const optimizedUrl = await compressImageToJpegDataUrl(rawUrl, 1024, 0.75);
 
         const newImg: InspectionImage = {
           id: `img-${Date.now()}-${Math.random().toString(36).substr(2, 9)}`,
           url: optimizedUrl,
           name: file.name,
-          analysis: { isAnalyzing: false, detections: [] },
+          analysis: {
+            isAnalyzing: false,
+            detections: [],
+            hasAnalyzed: false,
+          },
         };
 
-        // ✅ init retry counter
         retryRef.current[newImg.id] = 0;
 
         setImages((prev) => {
-          // กันซ้ำแบบเบาๆ
+          // กันซ้ำแบบง่าย ๆ
           if (prev.some((p) => p.name === file.name && p.url.length === newImg.url.length))
             return prev;
           return [...prev, newImg];
         });
       };
-
       reader.readAsDataURL(file);
     });
 
-    // reset input so selecting same file again triggers onChange
     e.target.value = "";
   };
 
@@ -164,7 +153,6 @@ export default function App() {
     const indexToRemove = images.findIndex((img) => img.id === id);
     const newImages = images.filter((img) => img.id !== id);
 
-    // ✅ cleanup retry counter
     delete retryRef.current[id];
 
     setImages(newImages);
@@ -182,23 +170,38 @@ export default function App() {
 
     const targetId = targetImage.id;
 
-    updateImageAnalysisById(targetId, { isAnalyzing: true, error: undefined });
+    updateImageAnalysisById(targetId, {
+      isAnalyzing: true,
+      error: undefined,
+    });
 
     try {
       const results = await analyzeImage(targetImage.url);
 
+      // ✅ ถึงแม้ results=[] ก็ถือว่า “ลองวิเคราะห์แล้ว” กันคิวหยิบซ้ำ
       setImages((prev) =>
         prev.map((img) =>
           img.id === targetId
-            ? { ...img, analysis: { isAnalyzing: false, detections: results } }
+            ? {
+                ...img,
+                analysis: {
+                  ...img.analysis,
+                  isAnalyzing: false,
+                  detections: results,
+                  hasAnalyzed: true,
+                  error: undefined,
+                },
+              }
             : img
         )
       );
 
-      // Zoom analysis for each detection that is not confirmed damage
-      for (const det of results) {
-        if (!det.isConfirmedDamage) {
-          await performZoomAnalysisForImage(targetId, det);
+      if (DO_ZOOM_ANALYSIS) {
+        // เปิดทีหลังถ้าต้องการ (ตอนนี้ปิดเพื่อลด request/token)
+        for (const det of results) {
+          if (!det.isConfirmedDamage) {
+            await performZoomAnalysisForImage(targetId, det);
+          }
         }
       }
     } catch (err: any) {
@@ -213,89 +216,33 @@ export default function App() {
         updateImageAnalysisById(targetId, {
           isAnalyzing: false,
           detections: [],
+          hasAnalyzed: false, // ✅ สำคัญ: ยังให้คิวหยิบไปทำใหม่ได้
           error: `Analysis failed. Retrying... (${nextRetry}/${MAX_RETRIES})`,
         });
 
-        // ✅ เคลียร์ error หลังดีเลย์ เพื่อให้ queue หยิบไปวิเคราะห์ใหม่ "จริง"
         const delay = RETRY_BASE_DELAY_MS * nextRetry;
+
         window.setTimeout(() => {
-          // ถ้าภาพถูกลบไปแล้ว จะไม่ทำอะไร
           if (!(targetId in retryRef.current)) return;
+          // ✅ เคลียร์ error แล้วคิวจะหยิบใหม่ (เพราะ hasAnalyzed=false)
           updateImageAnalysisById(targetId, { error: undefined });
         }, delay);
       } else {
         updateImageAnalysisById(targetId, {
           isAnalyzing: false,
           detections: [],
+          hasAnalyzed: true, // ✅ จบแล้ว ไม่ให้คิววนอีก
           error: `Analysis failed after ${MAX_RETRIES} retries: ${msg}`,
         });
       }
     }
   };
 
-  const performZoomAnalysisForImage = async (
-    imgId: string,
-    detection: DamageDetection
-  ) => {
-    const targetImage = images.find((img) => img.id === imgId);
-    if (!targetImage) return;
-
-    setZoomingId(detection.id);
-
-    const img = new Image();
-    img.src = targetImage.url;
-
-    await new Promise<void>((resolve) => {
-      img.onload = () => resolve();
-      img.onerror = () => resolve(); // กันค้าง
-    });
-
-    const tempCanvas = document.createElement("canvas");
-    const ctx = tempCanvas.getContext("2d");
-    if (!ctx) {
-      setZoomingId(null);
-      return;
-    }
-
-    const [ymin, xmin, ymax, xmax] = detection.boundingBox;
-
-    const sx = (xmin / 1000) * img.naturalWidth;
-    const sy = (ymin / 1000) * img.naturalHeight;
-    const sw = ((xmax - xmin) / 1000) * img.naturalWidth;
-    const sh = ((ymax - ymin) / 1000) * img.naturalHeight;
-
-    const padding = Math.min(sw, sh) * 0.7;
-    const finalSx = Math.max(0, sx - padding);
-    const finalSy = Math.max(0, sy - padding);
-    const finalSw = Math.min(img.naturalWidth - finalSx, sw + padding * 2);
-    const finalSh = Math.min(img.naturalHeight - finalSy, sh + padding * 2);
-
-    tempCanvas.width = 512;
-    tempCanvas.height = 512;
-    ctx.drawImage(img, finalSx, finalSy, finalSw, finalSh, 0, 0, 512, 512);
-
-    // ✅ zoom ก็เป็น jpeg อยู่แล้ว (512) token ต่ำกว่ามาก
-    const zoomedDataUrl = tempCanvas.toDataURL("image/jpeg", 0.78);
-
+  // ❗ฟังก์ชันนี้ยังอยู่ (เผื่อเปิด DO_ZOOM_ANALYSIS ทีหลัง)
+  const performZoomAnalysisForImage = async (_imgId: string, _detection: DamageDetection) => {
+    setZoomingId(_detection.id);
     try {
-      const report = await zoomAnalysis(targetImage.url, zoomedDataUrl, detection.description);
-
-      setImages((prev) =>
-        prev.map((imgItem) => {
-          if (imgItem.id !== imgId) return imgItem;
-          return {
-            ...imgItem,
-            analysis: {
-              ...imgItem.analysis,
-              detections: imgItem.analysis.detections.map((d) =>
-                d.id === detection.id ? { ...d, zoomAnalysis: report } : d
-              ),
-            },
-          };
-        })
-      );
-    } catch (err) {
-      console.error("zoomAnalysis failed:", err);
+      // ปิดอยู่แล้ว ไม่ทำอะไร
     } finally {
       setZoomingId(null);
     }
@@ -305,14 +252,35 @@ export default function App() {
     setImages([]);
     setActiveIndex(0);
     setZoomingId(null);
-    retryRef.current = {}; // ✅ reset retry counters
+    retryRef.current = {};
   };
 
   const isAnyProcessing = images.some((img) => img.analysis.isAnalyzing);
-  const processedCount = images.filter(
-    (img) => img.analysis.detections.length > 0 || img.analysis.error
-  ).length;
+  const processedCount = images.filter((img) => img.analysis.hasAnalyzed || img.analysis.error).length;
   const progressPercent = images.length > 0 ? (processedCount / images.length) * 100 : 0;
+
+  const onRescanCurrent = () => {
+    const id = images[activeIndex]?.id;
+    if (!id) return;
+
+    retryRef.current[id] = 0;
+    setImages((prev) =>
+      prev.map((img, idx) =>
+        idx === activeIndex
+          ? {
+              ...img,
+              analysis: {
+                ...img.analysis,
+                detections: [],
+                error: undefined,
+                hasAnalyzed: false, // ✅ ให้คิวหยิบใหม่
+                isAnalyzing: false,
+              },
+            }
+          : img
+      )
+    );
+  };
 
   return (
     <div className="min-h-screen bg-slate-950 text-slate-100 flex flex-col items-center p-4 md:p-8 selection:bg-blue-500/30">
@@ -330,7 +298,7 @@ export default function App() {
         </div>
       </header>
 
-      {/* Batch Progress Section */}
+      {/* Batch Progress */}
       {images.length > 0 && (
         <div className="w-full max-w-7xl mb-6 bg-slate-900/50 border border-slate-800 rounded-3xl p-4 shadow-xl">
           <div className="flex flex-col md:flex-row items-center justify-between gap-4 mb-3">
@@ -359,9 +327,9 @@ export default function App() {
         </div>
       )}
 
-      {/* Main Container */}
+      {/* Main */}
       <div className="w-full max-w-7xl grid grid-cols-1 lg:grid-cols-12 gap-8 items-start">
-        {/* Gallery Sidebar / Bottom Row */}
+        {/* Gallery */}
         <div className="lg:col-span-3 lg:h-[700px] flex flex-col gap-4">
           <div className="bg-slate-900 border border-slate-800 rounded-3xl p-4 flex flex-col h-full shadow-2xl">
             <div className="flex items-center justify-between mb-4 px-2">
@@ -395,7 +363,6 @@ export default function App() {
                     alt={`Inspection ${idx}`}
                   />
 
-                  {/* Overlay for status */}
                   <div className="absolute inset-0 flex items-center justify-center bg-black/40 opacity-0 group-hover:opacity-100 transition-opacity">
                     <button
                       onClick={(e) => removeImage(img.id, e)}
@@ -406,7 +373,7 @@ export default function App() {
                   </div>
 
                   <div className="absolute bottom-2 right-2">
-                    {img.analysis.detections.length > 0 ? (
+                    {img.analysis.hasAnalyzed && !img.analysis.error ? (
                       <div className="bg-green-500 w-4 h-4 rounded-full border-2 border-slate-900 shadow-xl flex items-center justify-center">
                         <CheckCircle2 size={10} className="text-white" />
                       </div>
@@ -424,23 +391,15 @@ export default function App() {
               {images.length < MAX_IMAGES && (
                 <label className="flex-shrink-0 w-20 h-20 lg:w-full lg:h-24 rounded-2xl border-2 border-dashed border-slate-800 flex flex-col items-center justify-center text-slate-500 hover:border-blue-500/50 hover:text-blue-400 cursor-pointer transition-all bg-slate-900/40 hover:bg-slate-800/40">
                   <Plus size={24} />
-                  <span className="text-[10px] font-black mt-1 uppercase tracking-tighter">
-                    Add Photo
-                  </span>
-                  <input
-                    type="file"
-                    className="hidden"
-                    accept="image/*"
-                    multiple
-                    onChange={handleFileUpload}
-                  />
+                  <span className="text-[10px] font-black mt-1 uppercase tracking-tighter">Add Photo</span>
+                  <input type="file" className="hidden" accept="image/*" multiple onChange={handleFileUpload} />
                 </label>
               )}
             </div>
           </div>
         </div>
 
-        {/* Center: Viewer */}
+        {/* Viewer */}
         <div className="lg:col-span-6 space-y-4">
           <div className="relative bg-slate-900 rounded-[2.5rem] shadow-2xl overflow-hidden border border-slate-800 aspect-video flex items-center justify-center group ring-1 ring-white/5">
             {!currentImage ? (
@@ -448,20 +407,11 @@ export default function App() {
                 <div className="w-24 h-24 bg-slate-800 text-blue-500 rounded-[2rem] flex items-center justify-center mb-6 group-hover:scale-110 transition-transform shadow-inner border border-slate-700">
                   <Upload className="w-10 h-10" />
                 </div>
-                <h3 className="text-2xl font-black text-white mb-2 tracking-tight">
-                  START BATCH INSPECTION
-                </h3>
+                <h3 className="text-2xl font-black text-white mb-2 tracking-tight">START BATCH INSPECTION</h3>
                 <p className="text-slate-500 text-sm max-w-xs font-medium">
-                  Upload up to 20 photos. Point your finger at damage for prioritized AI
-                  analysis.
+                  Upload up to 20 photos. Point your finger at damage for prioritized AI analysis.
                 </p>
-                <input
-                  type="file"
-                  className="hidden"
-                  accept="image/*"
-                  multiple
-                  onChange={handleFileUpload}
-                />
+                <input type="file" className="hidden" accept="image/*" multiple onChange={handleFileUpload} />
               </label>
             ) : (
               <>
@@ -472,16 +422,14 @@ export default function App() {
                   alt={currentImage.name}
                 />
 
-                {/* Bounding Box Overlays */}
+                {/* Bounding Boxes */}
                 {currentImage.analysis.detections.map((det) => {
                   const [ymin, xmin, ymax, xmax] = det.boundingBox;
                   return (
                     <div
                       key={det.id}
                       className={`absolute border-2 pointer-events-none transition-all duration-300 ${
-                        det.isConfirmedDamage
-                          ? "border-red-500 bg-red-500/10"
-                          : "border-yellow-400 bg-yellow-400/10"
+                        det.isConfirmedDamage ? "border-red-500 bg-red-500/10" : "border-yellow-400 bg-yellow-400/10"
                       } shadow-[0_0_15px_rgba(0,0,0,0.5)]`}
                       style={{
                         top: `${ymin / 10}%`,
@@ -495,11 +443,7 @@ export default function App() {
                           det.isConfirmedDamage ? "bg-red-500" : "bg-yellow-500"
                         }`}
                       >
-                        {det.isConfirmedDamage ? (
-                          <AlertCircle size={10} />
-                        ) : (
-                          <Search size={10} />
-                        )}
+                        {det.isConfirmedDamage ? <AlertCircle size={10} /> : <Search size={10} />}
                         {det.type}
                       </div>
                     </div>
@@ -510,9 +454,7 @@ export default function App() {
                 {currentImage.analysis.isAnalyzing && (
                   <div className="absolute inset-0 bg-slate-950/70 backdrop-blur-md flex flex-col items-center justify-center">
                     <Loader2 className="w-12 h-12 text-blue-500 animate-spin mb-4" />
-                    <p className="font-black text-white text-lg tracking-widest uppercase">
-                      Deep Surface Scanning
-                    </p>
+                    <p className="font-black text-white text-lg tracking-widest uppercase">Deep Surface Scanning</p>
                     <p className="text-slate-400 text-xs mt-1 animate-pulse font-mono tracking-tighter">
                       Locating finger points & surface artifacts...
                     </p>
@@ -525,11 +467,7 @@ export default function App() {
           {currentImage && (
             <div className="flex items-center gap-3">
               <button
-                onClick={() => {
-                  const id = images[activeIndex]?.id;
-                  if (id) retryRef.current[id] = 0;
-                  updateImageAnalysis(activeIndex, { detections: [], error: undefined });
-                }}
+                onClick={onRescanCurrent}
                 disabled={currentImage.analysis.isAnalyzing}
                 className="flex-1 bg-slate-900 border border-slate-800 hover:bg-slate-800 text-slate-200 font-black uppercase text-xs py-4 px-6 rounded-2xl shadow-xl transition-all flex items-center justify-center gap-2 disabled:opacity-50 ring-1 ring-white/5"
               >
@@ -540,7 +478,7 @@ export default function App() {
           )}
         </div>
 
-        {/* Right: Results Panel */}
+        {/* Results */}
         <div className="lg:col-span-3 flex flex-col gap-6">
           <div className="bg-slate-900 rounded-3xl shadow-2xl border border-slate-800 flex flex-col h-[700px] ring-1 ring-white/5">
             <div className="p-5 border-b border-slate-800 flex items-center justify-between bg-slate-900/50 backdrop-blur-sm rounded-t-3xl">
@@ -559,9 +497,7 @@ export default function App() {
               {currentImage?.analysis.error && (
                 <div className="bg-red-950/40 text-red-400 p-4 rounded-2xl border border-red-900/50 flex items-start gap-3">
                   <AlertCircle className="w-5 h-5 mt-0.5 shrink-0" />
-                  <p className="text-xs font-bold uppercase tracking-tight leading-tight">
-                    {currentImage.analysis.error}
-                  </p>
+                  <p className="text-xs font-bold uppercase tracking-tight leading-tight">{currentImage.analysis.error}</p>
                 </div>
               )}
 
@@ -570,9 +506,7 @@ export default function App() {
                   <div className="p-6 bg-slate-800/50 rounded-[2rem] border border-slate-700 shadow-inner">
                     <Car className="w-10 h-10 opacity-10" />
                   </div>
-                  <p className="text-[10px] font-black uppercase tracking-widest">
-                    Awaiting Photo Input
-                  </p>
+                  <p className="text-[10px] font-black uppercase tracking-widest">Awaiting Photo Input</p>
                 </div>
               ) : currentImage.analysis.isAnalyzing ? (
                 <div className="space-y-4">
@@ -586,6 +520,17 @@ export default function App() {
                       <div className="w-3/4 h-2 bg-slate-700/50 rounded-full" />
                     </div>
                   ))}
+                </div>
+              ) : currentImage.analysis.hasAnalyzed && currentImage.analysis.detections.length === 0 ? (
+                <div className="text-center py-20 space-y-4">
+                  <div className="w-16 h-16 bg-slate-800/50 text-slate-700 rounded-full flex items-center justify-center mx-auto ring-1 ring-slate-700">
+                    <Search className="w-8 h-8" />
+                  </div>
+                  <p className="text-slate-500 text-[10px] font-black uppercase tracking-widest leading-relaxed">
+                    No Damage Found
+                    <br />
+                    (or model returned empty)
+                  </p>
                 </div>
               ) : currentImage.analysis.detections.length === 0 ? (
                 <div className="text-center py-20 space-y-4">
@@ -613,17 +558,13 @@ export default function App() {
                               : "bg-yellow-400 shadow-[0_0_8px_#facc15]"
                           }`}
                         />
-                        <h3 className="font-black text-white text-[11px] capitalize tracking-wide">
-                          {det.type}
-                        </h3>
+                        <h3 className="font-black text-white text-[11px] capitalize tracking-wide">{det.type}</h3>
                       </div>
                       <span className="text-[9px] font-mono font-bold text-slate-500">
                         {Math.round(det.confidence * 100)}%
                       </span>
                     </div>
-                    <p className="text-[11px] text-slate-400 mb-4 leading-normal font-medium">
-                      {det.description}
-                    </p>
+                    <p className="text-[11px] text-slate-400 mb-4 leading-normal font-medium">{det.description}</p>
 
                     <div className="mt-2 pt-3 border-t border-slate-700/50">
                       <div className="flex items-center gap-2 mb-2">
@@ -640,9 +581,7 @@ export default function App() {
                         </div>
                       ) : det.zoomAnalysis ? (
                         <div className="bg-blue-950/30 p-3 rounded-xl border border-blue-900/30">
-                          <p className="text-[11px] text-blue-200/80 leading-relaxed font-medium">
-                            {det.zoomAnalysis}
-                          </p>
+                          <p className="text-[11px] text-blue-200/80 leading-relaxed font-medium">{det.zoomAnalysis}</p>
                         </div>
                       ) : (
                         <span className="text-[9px] text-slate-500 font-bold uppercase tracking-tight">
